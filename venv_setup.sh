@@ -1,17 +1,22 @@
-VENV_PATH="/var/scratch2/wdps1936"
 PWD_PATH=$(pwd)
+VENV_DIR=`basename $PWD_PATH`
+VENV_PATH="/var/scratch2/wdps1936/$VENV_DIR"
+TRIDENTDIR="/var/scratch2/wdps1936/build-python"
 
-# echo "Building virtual environment"
+echo "Building virtual environment"
 rm -rf venv VENV venv.zip   #delete soft links
+mkdir -p $VENV_PATH
 cd $VENV_PATH
 rm -rf venv VENV venv.zip   #delete actual files
-pip3 install --user virtualenv
-python3 ~/.local/lib/python3.6/site-packages/virtualenv.py -p python3 venv
+python3 -m pip install --user virtualenv
+python3 -m virtualenv venv
 source venv/bin/activate
+pip --version
 pip3 install -r $PWD_PATH/requirements.txt
-python3 -m spacy download en_core_web_sm
+python3 -m spacy download en_core_web_md
+cp -r $TRIDENTDIR venv/
 virtualenv --relocatable venv
-zip -r venv.zip venv
+zip -rq venv.zip venv
 mkdir VENV # Copy for Spark Driver Node:
 cp -r venv ./VENV/venv
 deactivate

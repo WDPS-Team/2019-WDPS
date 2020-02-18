@@ -1,75 +1,94 @@
-from pyspark import SparkContext, SparkFiles
+from pyspark import SparkContext, SparkFiles, SparkConf
 from WARCSplitReader import WARCSplitReader
-from TextPreprocessor import TextPreprocessor
-from EntityExtractor import EntityExtractor
-from EntityLinker import EntityLinker
+from TextExtraction import TextExtraction
+from EntityRecognition import EntityRecognition
+from ELCandidateGeneration import ELCandidateGeneration
 from OutputWriter import OutputWriter
+from ELCandidateRanking import ELCandidateRanking
+from ELMappingSelection import ELMappingSelection
 import argparse
 
+# Set Default Paramter for Entity Linking Pipeline
 parser = argparse.ArgumentParser()
 parser.add_argument("--es", help="Elastic Search instance.")
+parser.add_argument("--kb", help="Trident instance.")
 parser.add_argument("--f", help="Input file.")
+parser.add_argument("--debug", help="Output some debug data.")
+parser.add_argument("--hdfsout", help="Add some HDFS Outputdir")
 args = parser.parse_args()
 es_path = "localhost:9200"
 input_path = "sample.warc.gz"
+output_path = "output"
+debug = False
+ranking_threshold = 0.5
+model_root_path = "/var/scratch2/wdps1936/lib"
+kb_root_path = "/home/jurbani/data/motherkb-trident"
 if args.es:
     es_path = args.es
 if args.f:
     input_path = args.f
+if args.hdfsout:
+    output_path = args.hdfsout
+if args.debug == "True":
+    debug = True
+    model_root_path = "/data"
 
+# Initialization Messages
 print("Elastic Search Server:",es_path)
 print("Input file:", input_path)
+print("HDFS Out:", output_path)
 
-sc = SparkContext()
+conf = SparkConf().set("spark.ui.showConsoleProgress", "true")
+sc = SparkContext(conf=conf)
 
+print("STAGE 1 - Reading Input WARC")
 input_file = sc.textFile(input_path)
 
-# STAGE 1 - INPUT READING
-# -> READ warc files in a distributed manner
-# -> Clean all warc records (js, style) with lxml
 wsr = WARCSplitReader(sc, input_file.collect())
-parsed_rdd = wsr.parse_warc_records()
-print("Parsed WARC Records: {0}".format(parsed_rdd.count()))
-warc_recs_rdd = wsr.process_warc_records()
-print("Processed WARC Records: {0}".format(warc_recs_rdd.count()))
-filtered_rdd = wsr.filter_invalid_records()
-print("Filtered WARC Records: {0}".format(filtered_rdd.count()))
-print("STAGE 2 - Preprocessing Text")
-text_prepro = TextPreprocessor(filtered_rdd)
-cleaned_warc_records = text_prepro.clean_warc_responses()
-cleaned_warc_records.cache()
-print("\t Cleaned WARC Records: {0}".format(cleaned_warc_records.count()))
+wsr.parse_warc_records()
+wsr.process_warc_records()
+warc_stage_rdd = wsr.filter_invalid_records()
+warc_stage_rdd.cache()
+print("Processed: {0}".format(warc_stage_rdd.count()))
 
+print("STAGE 2 - Extracting Text")
+text_prepro = TextExtraction(warc_stage_rdd)
+text_prepro.clean_warc_responses()
 text_prepro.extract_text_from_document()
-fit_cleaned_warc_records = text_prepro.filter_unfit_records()
-print("\t Records fit for Extraction: {0}".format(fit_cleaned_warc_records.count()))
-# cleaned_warc_records.sortBy(lambda row: (row["_id"])).repartition(1).saveAsTextFile("output/cleaned_warc_records")
-# fit_cleaned_warc_records.sortBy(lambda row: (row["_id"])).repartition(1).saveAsTextFile("output/fit_cleaned_warc_records")
-print("FINSIHED STAGE 2")
+txtprepro_stage_rdd = text_prepro.filter_unfit_records()
+txtprepro_stage_rdd.cache()
+print("Processed: {0}".format(txtprepro_stage_rdd.count()))
 
-# LIMIT the records for dev:
-fit_cleaned_warc_records = fit_cleaned_warc_records.sortBy(lambda row: (row["_id"]) )
-fit_cleaned_warc_records = sc.parallelize(fit_cleaned_warc_records.take(20))
+print("STAGE 3 - Entity Recognition incl. NLP-Preprocessing")
+ee = EntityRecognition(txtprepro_stage_rdd)
+ee_stage_rdd = ee.extract()
+ee_stage_rdd.cache()
+ee_stage_rdd = ee.join_paragraphs()
+ee_stage_rdd.cache()
+print("Processed: {0}".format(ee_stage_rdd.count()))
 
-print("Contintue with: {0}".format(fit_cleaned_warc_records.count()))
-# STAGE 2 - Entity Extraction
-ee = EntityExtractor(fit_cleaned_warc_records)
-docs_with_entity_candidates = ee.extract()
-print("Processed Docs with Entity Candidates {0}".format(docs_with_entity_candidates.count()))
-out = docs_with_entity_candidates
-docs_with_entity_candidates.repartition(1).saveAsTextFile("output/candidates")
+print("STAGE 4 - Entity Linking - Candidate Generation")
+el_cg = ELCandidateGeneration(ee_stage_rdd, es_path, ranking_threshold, model_root_path)
+candidates_rdd = el_cg.get_candidates_from_elasticsearch()
+candidates_rdd.cache()
+print("Processed: {0}".format(candidates_rdd.count()))
 
-print("FINSIHED STAGE 2")
-# STAGE 4 - Entity Linking
-el = EntityLinker(docs_with_entity_candidates, es_path)
-linked_entities = el.link()
+print("STAGE 5 - Entity Linking - Candidate Ranking")
+el_cr = ELCandidateRanking(candidates_rdd, kb_root_path, ranking_threshold, model_root_path)
+el_cr.rank_entity_candidates()
+ranked_candidates_rdd = el_cr.rank_entity_type()
+ranked_candidates_rdd.cache()
+print("Processed: {0}".format(ranked_candidates_rdd.count()))
 
-print("FINISHED STAGE 4")
+print("STAGE 6 - Entity Linking - Mapping Selection")
+el_ms = ELMappingSelection(ranked_candidates_rdd)
+selected_entities_rdd = el_ms.select()
+selected_entities_rdd.cache()
+print("Processed: {0}".format(selected_entities_rdd.count()))
 
-# # STAGE 5 - Transform and Output
-ow = OutputWriter(linked_entities)
-ow.transform()
-
-output_rdd = ow.convert_to_tsv()
-output_rdd.cache()
-output_rdd.saveAsTextFile("output/predictions.tsv") #TODO: Investigate why freebase returns empty IDs (sometimes)
+print("STAGE 7 - Writing Output")
+ow = OutputWriter(selected_entities_rdd)
+ow_stage_rdd = ow.convert_to_tsv()
+ow_stage_rdd.cache()
+print("Processed: {0}".format(ow_stage_rdd.count()))
+ow_stage_rdd.saveAsTextFile(output_path +"/predictions.tsv")

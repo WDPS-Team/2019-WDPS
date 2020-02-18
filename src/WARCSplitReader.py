@@ -4,11 +4,15 @@ from lxml.html.clean import Cleaner
 import lxml.html as lh
 from lxml import etree
 import bs4
-from config import TMP_FOLDER, WARC_ID, WARC_PER_DOC
 
+WARC_ID = "WARC-TREC-ID"
 
 class WARCSplitReader:
-
+    """
+        Extracting warc records from the input file
+        - WARC-TREC-ID is used to uniquely identify each document
+        - Empty and corrupted warc records are filtered out
+    """
     def __init__(self, spark_session, lines_of_input_file):
         self.sc = spark_session
         self.raw_lines = lines_of_input_file
@@ -41,15 +45,15 @@ class WARCSplitReader:
 
         def process(row):
             record = row["warc"]
-            result = {"id": None, "data": None, "status": "ok"}
+            result = {"_id": None, "data": None, "status": "ok"}
             try:
                 html = record.content_stream().read()  # reads payload from the record
                 if len(html) == 0:
-                    result["status": "empty html"]
+                    result["status"] = "empty html"
                     return result
                 rec_id = record.rec_headers.get_header(WARC_ID)
                 data = html
-                result["id"] = rec_id
+                result["_id"] = rec_id
                 result["data"] = data
                 result["type"] = record.rec_type
                 return result
@@ -63,6 +67,6 @@ class WARCSplitReader:
         return self.processed_warcs_records
 
     def filter_invalid_records(self):
-        self.filtered_warc_responses = self.processed_warcs_records.filter(lambda record: record["id"] != None)
+        self.filtered_warc_responses = self.processed_warcs_records.filter(lambda record: record["_id"] != None)
         return self.filtered_warc_responses
 
